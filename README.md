@@ -1,111 +1,207 @@
-# Multi-Container Runtime
+# Multi-Container Runtime (OS-Jackfruit Extension)
 
 A lightweight Linux container runtime in C with a long-running supervisor and a kernel-space memory monitor.
 
-Read [`project-guide.md`](project-guide.md) for the full project specification.
+This project extends the base OS-Jackfruit framework with:
+- Multi-container supervisor (user space)
+- Kernel-level memory monitoring using RSS
+- Soft and hard memory limits per container
+- Lifecycle tracking (RUNNING / STOPPED / HARD_KILLED / EXITED)
 
 ---
 
-## Getting Started
+# Project Structure
 
-### 1. Fork the Repository
+OS-Jackfruit/
+│
+├── boilerplate/
+│   ├── engine.c              # user-space supervisor
+│   ├── monitor.c            # kernel memory monitor
+│   ├── monitor_ioctl.h      # ioctl definitions
+│   ├── Makefile
+│
+├── rootfs-alpha/            # optional test filesystem
+├── rootfs-beta/             # optional test filesystem
+├── rootfs-base/             # base template filesystem
+│
+├── logs/                    # runtime logs
+└── README.md
 
-1. Go to [github.com/shivangjhalani/OS-Jackfruit](https://github.com/shivangjhalani/OS-Jackfruit)
-2. Click **Fork** (top-right)
-3. Clone your fork:
+---
 
-```bash
-git clone https://github.com/<your-username>/OS-Jackfruit.git
-cd OS-Jackfruit
-```
+# Getting Started
 
-### 2. Set Up Your VM
+## 1. VM Requirements
 
-You need an **Ubuntu 22.04 or 24.04** VM with **Secure Boot OFF**. WSL will not work.
+- Ubuntu 22.04 / 24.04
+- Secure Boot OFF
+- Linux kernel headers installed
 
 Install dependencies:
 
-```bash
 sudo apt update
 sudo apt install -y build-essential linux-headers-$(uname -r)
-```
-
-### 3. Run the Environment Check
-
-```bash
-cd boilerplate
-chmod +x environment-check.sh
-sudo ./environment-check.sh
-```
-
-Fix any issues reported before moving on.
-
-### 4. Prepare the Root Filesystem
-
-```bash
-mkdir rootfs-base
-wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
-tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
-
-# Make one writable copy per container you plan to run
-cp -a ./rootfs-base ./rootfs-alpha
-cp -a ./rootfs-base ./rootfs-beta
-```
-
-Do not commit `rootfs-base/` or `rootfs-*` directories to your repository.
-
-### 5. Understand the Boilerplate
-
-The `boilerplate/` folder contains starter files:
-
-| File                   | Purpose                                             |
-| ---------------------- | --------------------------------------------------- |
-| `engine.c`             | User-space runtime and supervisor skeleton          |
-| `monitor.c`            | Kernel module skeleton                              |
-| `monitor_ioctl.h`      | Shared ioctl command definitions                    |
-| `Makefile`             | Build targets for both user-space and kernel module |
-| `cpu_hog.c`            | CPU-bound test workload                             |
-| `io_pulse.c`           | I/O-bound test workload                             |
-| `memory_hog.c`         | Memory-consuming test workload                      |
-| `environment-check.sh` | VM environment preflight check                      |
-
-Use these as your starting point. You are free to restructure the repository however you want — the submission requirements are listed in the project guide.
-
-### 6. Build and Verify
-
-```bash
-cd boilerplate
-make
-```
-
-If this compiles without errors, your environment is ready.
-
-### 7. GitHub Actions Smoke Check
-
-Your fork will inherit a minimal GitHub Actions workflow from this repository.
-
-That workflow only performs CI-safe checks:
-
-- `make -C boilerplate ci`
-- user-space binary compilation (`engine`, `memory_hog`, `cpu_hog`, `io_pulse`)
-- `./boilerplate/engine` with no arguments must print usage and exit with a non-zero status
-
-The CI-safe build command is:
-
-```bash
-make -C boilerplate ci
-```
-
-This smoke check does not test kernel-module loading, supervisor runtime behavior, or container execution.
 
 ---
 
-## What to Do Next
+## 2. Build Kernel Module
 
-Read [`project-guide.md`](project-guide.md) end to end. It contains:
+cd boilerplate
+make -C /lib/modules/$(uname -r)/build M=$PWD modules
 
-- The six implementation tasks (multi-container runtime, CLI, logging, kernel monitor, scheduling experiments, cleanup)
-- The engineering analysis you must write
-- The exact submission requirements, including what your `README.md` must contain (screenshots, analysis, design decisions)
+---
 
-Your fork's `README.md` should be replaced with your own project documentation as described in the submission package section of the project guide. (As in get rid of all the above content and replace with your README.md)
+## 3. Insert Kernel Module
+
+sudo insmod monitor.ko
+
+Check:
+
+dmesg | tail
+
+---
+
+## 4. Create Device Node
+
+dmesg | grep container_monitor
+
+sudo mknod /dev/container_monitor c <MAJOR> 0
+sudo chmod 666 /dev/container_monitor
+
+---
+
+## 5. Build User Space Engine
+
+gcc engine.c -o engine -pthread
+
+---
+
+# Running the System
+
+## Start Supervisor
+
+./engine supervisor
+
+---
+
+## Start Containers
+
+./engine start c1
+./engine start c2
+
+---
+
+## List Containers
+
+./engine ps
+
+---
+
+## Stop Container
+
+./engine stop c1
+
+---
+
+# Kernel Memory Monitoring
+
+The kernel module monitors container memory usage using RSS.
+
+---
+
+## Soft Limit Behavior
+
+- Triggered when RSS exceeds soft limit
+- Logs warning in kernel logs (dmesg)
+- Triggered only once per container
+
+Example:
+
+[container_monitor] SOFT LIMIT: c1 pid=1234 rss=...
+
+---
+
+## Hard Limit Behavior
+
+- Triggered when RSS exceeds hard limit
+- Sends SIGKILL to process
+- Removes container from kernel tracking list
+
+Example:
+
+[container_monitor] HARD LIMIT: c1 pid=1234 rss=...
+
+---
+
+# Container Lifecycle States
+
+RUNNING      -> container active  
+STOPPED      -> manually stopped by supervisor  
+HARD_KILLED  -> killed by kernel monitor  
+EXITED       -> normal termination  
+
+---
+
+# Key Components
+
+## engine.c (User Space)
+- fork-based container creation
+- ioctl registration with kernel
+- container lifecycle tracking
+- stop / ps commands
+
+---
+
+## monitor.c (Kernel Module)
+- linked list container tracking
+- spinlock protected shared state
+- periodic RSS monitoring using timer
+- soft/hard memory enforcement
+- automatic cleanup of dead processes
+
+---
+
+## Communication
+- ioctl interface
+- device: /dev/container_monitor
+
+---
+
+# Demo Flow
+
+1. Start supervisor  
+   ./engine supervisor
+
+2. Start container  
+   ./engine start c1
+
+3. Check kernel registration  
+   dmesg | grep container_monitor
+
+4. Observe soft limit  
+   dmesg | grep SOFT
+
+5. Observe hard limit  
+   dmesg | grep HARD
+
+6. Check status  
+   ./engine ps
+
+---
+
+# Notes
+
+- rootfs is optional and not required for Task 4 correctness
+- system focuses on kernel-level memory monitoring
+- designed for Linux kernel 6.x
+
+---
+
+# Conclusion
+
+This project demonstrates:
+- kernel module programming
+- ioctl-based communication
+- process lifecycle tracking
+- memory monitoring using RSS
+- basic container runtime design
