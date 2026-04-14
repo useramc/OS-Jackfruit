@@ -11,33 +11,43 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <errno.h>
+
+#include "monitor_ioctl.h"
 
 #define STACK_SIZE (1024 * 1024)
 #define SOCKET_PATH "/tmp/mini_runtime.sock"
 #define BUFFER_SIZE 10
 
-// -------------------- CONTAINER LIST --------------------
+// -------------------- EXIT POLICY --------------------
+typedef enum {
+    RUNNING,
+    STOPPED,
+    HARD_LIMIT_KILLED,
+    EXITED
+} exit_reason_t;
+
+// -------------------- CONTAINER --------------------
 typedef struct container {
     char id[50];
     pid_t pid;
     int running;
-
     int stop_requested;
+
+    exit_reason_t reason;
     int exit_code;
-    int exit_signal;
 
     struct container *next;
 } container_t;
 
 container_t *head = NULL;
 
-// -------------------- LOG STRUCT --------------------
+// -------------------- LOG BUFFER (UNCHANGED) --------------------
 typedef struct {
     char id[50];
     char data[256];
 } log_item_t;
 
-// -------------------- BUFFER --------------------
 log_item_t buffer[BUFFER_SIZE];
 int in = 0, out = 0, count = 0;
 
@@ -45,19 +55,7 @@ pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t not_full = PTHREAD_COND_INITIALIZER;
 pthread_cond_t not_empty = PTHREAD_COND_INITIALIZER;
 
-// -------------------- CHILD ARG --------------------
-typedef struct {
-    char rootfs[100];
-    int pipefd[2];
-} child_args_t;
-
-// -------------------- PRODUCER ARG --------------------
-typedef struct {
-    int fd;
-    char id[50];
-} producer_arg_t;
-
-// -------------------- BUFFER PUSH --------------------
+// -------------------- BUFFER OPS --------------------
 void buffer_push(log_item_t item) {
     pthread_mutex_lock(&mutex);
 
@@ -72,7 +70,6 @@ void buffer_push(log_item_t item) {
     pthread_mutex_unlock(&mutex);
 }
 
-// -------------------- BUFFER POP --------------------
 void buffer_pop(log_item_t *item) {
     pthread_mutex_lock(&mutex);
 
@@ -87,16 +84,19 @@ void buffer_pop(log_item_t *item) {
     pthread_mutex_unlock(&mutex);
 }
 
-// -------------------- LOGGER --------------------
+// -------------------- LOGGER THREAD --------------------
 void *logger_thread(void *arg) {
+    (void)arg;
+    mkdir("logs", 0777);
+
     while (1) {
         log_item_t item;
         buffer_pop(&item);
 
-        char filename[100];
-        sprintf(filename, "logs/%s.log", item.id);
+        char path[128];
+        snprintf(path, sizeof(path), "logs/%s.log", item.id);
 
-        FILE *fp = fopen(filename, "a");
+        FILE *fp = fopen(path, "a");
         if (fp) {
             fprintf(fp, "%s", item.data);
             fclose(fp);
@@ -105,53 +105,80 @@ void *logger_thread(void *arg) {
     return NULL;
 }
 
-// -------------------- PRODUCER --------------------
+// -------------------- PRODUCER THREAD --------------------
+typedef struct {
+    int fd;
+    char id[50];
+} producer_arg_t;
+
 void *producer(void *arg) {
-    producer_arg_t *parg = (producer_arg_t *)arg;
+    producer_arg_t *p = (producer_arg_t *)arg;
     char buf[256];
 
     while (1) {
-        int n = read(parg->fd, buf, sizeof(buf) - 1);
+        int n = read(p->fd, buf, sizeof(buf) - 1);
         if (n <= 0) break;
 
         buf[n] = '\0';
 
         log_item_t item;
-        strcpy(item.id, parg->id);
+        strcpy(item.id, p->id);
         strcpy(item.data, buf);
 
         buffer_push(item);
     }
 
-    close(parg->fd);
-    free(parg);
+    close(p->fd);
+    free(p);
     return NULL;
 }
 
+// -------------------- KERNEL REGISTRATION --------------------
+void register_to_kernel(char *id, pid_t pid) {
+    int fd = open("/dev/container_monitor", O_RDWR);
+    if (fd < 0) return;
+
+    struct monitor_request req;
+    memset(&req, 0, sizeof(req));
+
+    strncpy(req.container_id, id, sizeof(req.container_id) - 1);
+    req.pid = pid;
+
+    req.soft_limit_bytes = 50 * 1024 * 1024;
+    req.hard_limit_bytes = 80 * 1024 * 1024;
+
+    ioctl(fd, MONITOR_REGISTER, &req);
+    close(fd);
+}
+
 // -------------------- CHILD --------------------
-int child_func(void *arg) {
-    child_args_t *args = (child_args_t *)arg;
+int child_func(void *arg)
+{
+    char **a = (char **)arg;
 
-    close(args->pipefd[0]);
+    printf("[child] starting...\n");
 
-    dup2(args->pipefd[1], STDOUT_FILENO);
-    dup2(args->pipefd[1], STDERR_FILENO);
-    close(args->pipefd[1]);   // IMPORTANT
-
-    printf("Inside container...\n");
-
-    if (chroot(args->rootfs) != 0) {
+    if (chroot(a[0]) != 0) {
         perror("chroot failed");
         exit(1);
     }
 
-    chdir("/");
-    mount("proc", "/proc", "proc", 0, NULL);
+    if (chdir("/") != 0) {
+        perror("chdir failed");
+        exit(1);
+    }
+
+    mkdir("/proc", 0555);
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
+        perror("proc mount failed");
+    }
+
+    printf("[child] inside container rootfs OK\n");
 
     char *cmd[] = {
         "/bin/sh",
         "-c",
-        "echo Container started; while true; do echo Container running...; sleep 1; done",
+        "while true; do echo running; sleep 1; done",
         NULL
     };
 
@@ -161,193 +188,161 @@ int child_func(void *arg) {
     return 1;
 }
 
+
 // -------------------- SUPERVISOR --------------------
 void run_supervisor() {
-
     printf("Supervisor started...\n");
 
-    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int server = socket(AF_UNIX, SOCK_STREAM, 0);
 
     struct sockaddr_un addr;
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, SOCKET_PATH);
 
     unlink(SOCKET_PATH);
+    bind(server, (struct sockaddr*)&addr, sizeof(addr));
+    listen(server, 5);
 
-    bind(server_fd, (struct sockaddr *)&addr, sizeof(addr));
-    listen(server_fd, 5);
-
-    printf("Listening on socket...\n");
-
-    pthread_t logger;
-    pthread_create(&logger, NULL, logger_thread, NULL);
+    pthread_t logt;
+    pthread_create(&logt, NULL, logger_thread, NULL);
 
     while (1) {
+        int cfd = accept(server, NULL, NULL);
+        char buf[256];
+memset(buf, 0, sizeof(buf));
 
-        int client_fd = accept(server_fd, NULL, NULL);
+int n = read(cfd, buf, sizeof(buf) - 1);
 
-        char buffer_cmd[256] = {0};
-        read(client_fd, buffer_cmd, sizeof(buffer_cmd));
+if (n <= 0) {
+    close(cfd);
+    continue;
+}
 
-        printf("Received: %s\n", buffer_cmd);
+buf[n] = '\0';
 
-        // -------- START --------
-        if (strncmp(buffer_cmd, "start", 5) == 0) {
+printf("Received: %s\n", buf);
+
+
+        // ---------------- START ----------------
+        if (strncmp(buf, "start", 5) == 0) {
 
             char id[50], rootfs[100], cmd[100];
-            sscanf(buffer_cmd, "start %s %s %s", id, rootfs, cmd);
+            sscanf(buf, "start %s %s %s", id, rootfs, cmd);
 
             char *stack = malloc(STACK_SIZE);
-            char *stack_top = stack + STACK_SIZE;
+            char **args = malloc(sizeof(char*) * 2);
+            args[0] = strdup(rootfs);
 
-            child_args_t *args = malloc(sizeof(child_args_t));
-            strcpy(args->rootfs, rootfs);
-            pipe(args->pipefd);
+            pid_t pid = clone(child_func,
+                              stack + STACK_SIZE,
+                              CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
+                              args);
 
-            pid_t pid = clone(child_func, stack_top,
-                CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
-                args);
+            container_t *c = malloc(sizeof(container_t));
+            strcpy(c->id, id);
+            c->pid = pid;
+            c->running = 1;
+            c->stop_requested = 0;
+            c->reason = RUNNING;
+            c->next = head;
+            head = c;
 
-            printf("Started container %s (PID %d)\n", id, pid);
-
-            close(args->pipefd[1]);
-
-            producer_arg_t *parg = malloc(sizeof(producer_arg_t));
-            parg->fd = args->pipefd[0];
-            strcpy(parg->id, id);
-
-            pthread_t prod;
-            pthread_create(&prod, NULL, producer, parg);
-
-            container_t *newc = malloc(sizeof(container_t));
-            strcpy(newc->id, id);
-            newc->pid = pid;
-            newc->running = 1;
-            newc->stop_requested = 0;
-            newc->next = head;
-            head = newc;
+            register_to_kernel(id, pid);
+            printf("Started %s (%d)\n", id, pid);
         }
 
-        // -------- STOP --------
-        else if (strncmp(buffer_cmd, "stop", 4) == 0) {
+        // ---------------- STOP ----------------
+        else if (strncmp(buf, "stop", 4) == 0) {
 
             char id[50];
-            sscanf(buffer_cmd, "stop %s", id);
+            sscanf(buf, "stop %s", id);
 
-            container_t *curr = head;
-
-            while (curr) {
-                if (strcmp(curr->id, id) == 0) {
-
-                    if (!curr->running) {
-                        printf("Already stopped\n");
-                        break;
-                    }
-
-                    curr->stop_requested = 1;
-                    kill(curr->pid, SIGKILL);
-
-                    printf("Stopping %s...\n", id);
+            for (container_t *c = head; c; c = c->next) {
+                if (!strcmp(c->id, id)) {
+                    c->stop_requested = 1;
+                    c->reason = STOPPED;
+                    kill(c->pid, SIGKILL);
                     break;
                 }
-                curr = curr->next;
             }
         }
 
-        // -------- PS --------
-        else if (strncmp(buffer_cmd, "ps", 2) == 0) {
+        // ---------------- PS + CLEANUP ----------------
+        else if (strncmp(buf, "ps", 2) == 0) {
 
-            container_t *curr = head;
+            int status;
+            pid_t pid;
 
-            printf("\n--- Containers ---\n");
-            while (curr) {
+            while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
 
-                char *reason = "RUNNING";
+                for (container_t *c = head; c; c = c->next) {
+                    if (c->pid == pid) {
 
-                if (!curr->running) {
-                    if (curr->stop_requested)
-                        reason = "STOPPED";
-                    else if (curr->exit_signal == SIGKILL)
-                        reason = "HARD_LIMIT_KILLED";
-                    else
-                        reason = "EXITED";
+                        c->running = 0;
+
+                        if (WIFSIGNALED(status) &&
+                            WTERMSIG(status) == SIGKILL &&
+                            !c->stop_requested) {
+                            c->reason = HARD_LIMIT_KILLED;
+                        } else if (!c->stop_requested) {
+                            c->reason = EXITED;
+                        }
+                    }
                 }
+            }
 
-                printf("ID: %s | PID: %d | %s\n",
-                       curr->id,
-                       curr->pid,
-                       reason);
+            printf("\n--- CONTAINERS ---\n");
+            for (container_t *c = head; c; c = c->next) {
 
-                curr = curr->next;
+                char *r =
+                    c->reason == RUNNING ? "RUNNING" :
+                    c->reason == STOPPED ? "STOPPED" :
+                    c->reason == HARD_LIMIT_KILLED ? "HARD_KILL" :
+                    "EXITED";
+
+                printf("%s | %d | %s\n", c->id, c->pid, r);
             }
             printf("------------------\n");
         }
 
-        close(client_fd);
-
-        // -------- WAIT + UPDATE --------
-        int status;
-        pid_t pid;
-
-        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-
-            container_t *curr = head;
-
-            while (curr) {
-                if (curr->pid == pid) {
-
-                    curr->running = 0;
-
-                    if (WIFEXITED(status))
-                        curr->exit_code = WEXITSTATUS(status);
-
-                    if (WIFSIGNALED(status))
-                        curr->exit_signal = WTERMSIG(status);
-
-                    printf("Container %s exited\n", curr->id);
-                    break;
-                }
-                curr = curr->next;
-            }
-        }
+        close(cfd);
     }
 }
 
 // -------------------- CLIENT --------------------
 void send_cmd(char *msg) {
-    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
 
     struct sockaddr_un addr;
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, SOCKET_PATH);
 
-    connect(sock, (struct sockaddr *)&addr, sizeof(addr));
-    write(sock, msg, strlen(msg));
-    close(sock);
+    connect(s, (struct sockaddr*)&addr, sizeof(addr));
+    write(s, msg, strlen(msg));
+    close(s);
 }
 
 // -------------------- MAIN --------------------
 int main(int argc, char *argv[]) {
 
-    if (argc < 2) return 1;
+    if (argc < 2) return 0;
 
-    if (strcmp(argv[1], "supervisor") == 0) {
+    if (!strcmp(argv[1], "supervisor"))
         run_supervisor();
+
+    else if (!strcmp(argv[1], "start")) {
+        char b[256];
+        sprintf(b, "start %s %s %s", argv[2], argv[3], argv[4]);
+        send_cmd(b);
     }
 
-    else if (strcmp(argv[1], "start") == 0) {
-        char buf[256];
-        sprintf(buf, "start %s %s %s", argv[2], argv[3], argv[4]);
-        send_cmd(buf);
+    else if (!strcmp(argv[1], "stop")) {
+        char b[256];
+        sprintf(b, "stop %s", argv[2]);
+        send_cmd(b);
     }
 
-    else if (strcmp(argv[1], "stop") == 0) {
-        char buf[256];
-        sprintf(buf, "stop %s", argv[2]);
-        send_cmd(buf);
-    }
-
-    else if (strcmp(argv[1], "ps") == 0) {
+    else if (!strcmp(argv[1], "ps")) {
         send_cmd("ps");
     }
 
