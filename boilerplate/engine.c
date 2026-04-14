@@ -21,6 +21,11 @@ typedef struct container {
     char id[50];
     pid_t pid;
     int running;
+
+    int stop_requested;
+    int exit_code;
+    int exit_signal;
+
     struct container *next;
 } container_t;
 
@@ -131,6 +136,7 @@ int child_func(void *arg) {
 
     dup2(args->pipefd[1], STDOUT_FILENO);
     dup2(args->pipefd[1], STDERR_FILENO);
+    close(args->pipefd[1]);   // IMPORTANT
 
     printf("Inside container...\n");
 
@@ -142,13 +148,13 @@ int child_func(void *arg) {
     chdir("/");
     mount("proc", "/proc", "proc", 0, NULL);
 
-    //char *cmd[] = {"/bin/sh", NULL};
     char *cmd[] = {
-    "/bin/sh",
-    "-c",
-    "while true; do echo Container running...; sleep 1; done",
-    NULL
-};
+        "/bin/sh",
+        "-c",
+        "echo Container started; while true; do echo Container running...; sleep 1; done",
+        NULL
+    };
+
     execvp(cmd[0], cmd);
 
     perror("exec failed");
@@ -161,8 +167,8 @@ void run_supervisor() {
     printf("Supervisor started...\n");
 
     int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un addr;
 
+    struct sockaddr_un addr;
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, SOCKET_PATH);
 
@@ -217,6 +223,7 @@ void run_supervisor() {
             strcpy(newc->id, id);
             newc->pid = pid;
             newc->running = 1;
+            newc->stop_requested = 0;
             newc->next = head;
             head = newc;
         }
@@ -231,9 +238,16 @@ void run_supervisor() {
 
             while (curr) {
                 if (strcmp(curr->id, id) == 0) {
+
+                    if (!curr->running) {
+                        printf("Already stopped\n");
+                        break;
+                    }
+
+                    curr->stop_requested = 1;
                     kill(curr->pid, SIGKILL);
-                    curr->running = 0;
-                    printf("Stopped %s\n", id);
+
+                    printf("Stopping %s...\n", id);
                     break;
                 }
                 curr = curr->next;
@@ -247,10 +261,23 @@ void run_supervisor() {
 
             printf("\n--- Containers ---\n");
             while (curr) {
+
+                char *reason = "RUNNING";
+
+                if (!curr->running) {
+                    if (curr->stop_requested)
+                        reason = "STOPPED";
+                    else if (curr->exit_signal == SIGKILL)
+                        reason = "HARD_LIMIT_KILLED";
+                    else
+                        reason = "EXITED";
+                }
+
                 printf("ID: %s | PID: %d | %s\n",
                        curr->id,
                        curr->pid,
-                       curr->running ? "RUNNING" : "STOPPED");
+                       reason);
+
                 curr = curr->next;
             }
             printf("------------------\n");
@@ -258,7 +285,31 @@ void run_supervisor() {
 
         close(client_fd);
 
-        while (waitpid(-1, NULL, WNOHANG) > 0);
+        // -------- WAIT + UPDATE --------
+        int status;
+        pid_t pid;
+
+        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+
+            container_t *curr = head;
+
+            while (curr) {
+                if (curr->pid == pid) {
+
+                    curr->running = 0;
+
+                    if (WIFEXITED(status))
+                        curr->exit_code = WEXITSTATUS(status);
+
+                    if (WIFSIGNALED(status))
+                        curr->exit_signal = WTERMSIG(status);
+
+                    printf("Container %s exited\n", curr->id);
+                    break;
+                }
+                curr = curr->next;
+            }
+        }
     }
 }
 
@@ -277,6 +328,8 @@ void send_cmd(char *msg) {
 
 // -------------------- MAIN --------------------
 int main(int argc, char *argv[]) {
+
+    if (argc < 2) return 1;
 
     if (strcmp(argv[1], "supervisor") == 0) {
         run_supervisor();
