@@ -42,7 +42,7 @@ typedef struct container {
 
 container_t *head = NULL;
 
-// -------------------- LOG BUFFER (UNCHANGED) --------------------
+// -------------------- LOG BUFFER --------------------
 typedef struct {
     char id[50];
     char data[256];
@@ -105,7 +105,7 @@ void *logger_thread(void *arg) {
     return NULL;
 }
 
-// -------------------- PRODUCER THREAD --------------------
+// -------------------- PRODUCER --------------------
 typedef struct {
     int fd;
     char id[50];
@@ -134,9 +134,12 @@ void *producer(void *arg) {
 }
 
 // -------------------- KERNEL REGISTRATION --------------------
-void register_to_kernel(char *id, pid_t pid) {
+void register_to_kernel(char *id, pid_t pid, int soft, int hard) {
     int fd = open("/dev/container_monitor", O_RDWR);
-    if (fd < 0) return;
+    if (fd < 0) {
+        perror("monitor open failed");
+        return;
+    }
 
     struct monitor_request req;
     memset(&req, 0, sizeof(req));
@@ -144,8 +147,8 @@ void register_to_kernel(char *id, pid_t pid) {
     strncpy(req.container_id, id, sizeof(req.container_id) - 1);
     req.pid = pid;
 
-    req.soft_limit_bytes = 50 * 1024 * 1024;
-    req.hard_limit_bytes = 80 * 1024 * 1024;
+    req.soft_limit_bytes = soft * 1024 * 1024;
+    req.hard_limit_bytes = hard * 1024 * 1024;
 
     ioctl(fd, MONITOR_REGISTER, &req);
     close(fd);
@@ -156,38 +159,23 @@ int child_func(void *arg)
 {
     char **a = (char **)arg;
 
-    printf("[child] starting...\n");
-
     if (chroot(a[0]) != 0) {
         perror("chroot failed");
         exit(1);
     }
 
-    if (chdir("/") != 0) {
-        perror("chdir failed");
-        exit(1);
-    }
+    chdir("/");
 
     mkdir("/proc", 0555);
-    if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
-        perror("proc mount failed");
-    }
+    mount("proc", "/proc", "proc", 0, NULL);
 
-    printf("[child] inside container rootfs OK\n");
+    printf("[child] running: %s\n", a[1]);
 
-    char *cmd[] = {
-        "/bin/sh",
-        "-c",
-        "while true; do echo running; sleep 1; done",
-        NULL
-    };
-
-    execvp(cmd[0], cmd);
+    execl("/bin/sh", "/bin/sh", "-c", a[1], NULL);
 
     perror("exec failed");
     return 1;
 }
-
 
 // -------------------- SUPERVISOR --------------------
 void run_supervisor() {
@@ -208,30 +196,32 @@ void run_supervisor() {
 
     while (1) {
         int cfd = accept(server, NULL, NULL);
+
         char buf[256];
-memset(buf, 0, sizeof(buf));
+        memset(buf, 0, sizeof(buf));
+        int n = read(cfd, buf, sizeof(buf) - 1);
 
-int n = read(cfd, buf, sizeof(buf) - 1);
+        if (n <= 0) {
+            close(cfd);
+            continue;
+        }
 
-if (n <= 0) {
-    close(cfd);
-    continue;
-}
-
-buf[n] = '\0';
-
-printf("Received: %s\n", buf);
-
+        buf[n] = '\0';
+        printf("Received: %s\n", buf);
 
         // ---------------- START ----------------
         if (strncmp(buf, "start", 5) == 0) {
 
             char id[50], rootfs[100], cmd[100];
-            sscanf(buf, "start %s %s %s", id, rootfs, cmd);
+            int soft = 40, hard = 64;
+
+            sscanf(buf, "start %s %s %s %d %d", id, rootfs, cmd, &soft, &hard);
 
             char *stack = malloc(STACK_SIZE);
             char **args = malloc(sizeof(char*) * 2);
+
             args[0] = strdup(rootfs);
+            args[1] = strdup(cmd);
 
             pid_t pid = clone(child_func,
                               stack + STACK_SIZE,
@@ -247,8 +237,9 @@ printf("Received: %s\n", buf);
             c->next = head;
             head = c;
 
-            register_to_kernel(id, pid);
-            printf("Started %s (%d)\n", id, pid);
+            register_to_kernel(id, pid, soft, hard);
+
+            printf("Started %s (%d) soft=%dMB hard=%dMB\n", id, pid, soft, hard);
         }
 
         // ---------------- STOP ----------------
@@ -262,12 +253,11 @@ printf("Received: %s\n", buf);
                     c->stop_requested = 1;
                     c->reason = STOPPED;
                     kill(c->pid, SIGKILL);
-                    break;
                 }
             }
         }
 
-        // ---------------- PS + CLEANUP ----------------
+        // ---------------- PS ----------------
         else if (strncmp(buf, "ps", 2) == 0) {
 
             int status;
@@ -280,11 +270,15 @@ printf("Received: %s\n", buf);
 
                         c->running = 0;
 
-                        if (WIFSIGNALED(status) &&
-                            WTERMSIG(status) == SIGKILL &&
-                            !c->stop_requested) {
-                            c->reason = HARD_LIMIT_KILLED;
-                        } else if (!c->stop_requested) {
+                        if (WIFSIGNALED(status)) {
+                            int sig = WTERMSIG(status);
+
+                            printf("[DEBUG] %s killed by signal %d\n", c->id, sig);
+
+                            if (sig == SIGKILL && !c->stop_requested)
+                                c->reason = HARD_LIMIT_KILLED;
+                        }
+                        else {
                             c->reason = EXITED;
                         }
                     }
@@ -292,6 +286,7 @@ printf("Received: %s\n", buf);
             }
 
             printf("\n--- CONTAINERS ---\n");
+
             for (container_t *c = head; c; c = c->next) {
 
                 char *r =
@@ -302,6 +297,7 @@ printf("Received: %s\n", buf);
 
                 printf("%s | %d | %s\n", c->id, c->pid, r);
             }
+
             printf("------------------\n");
         }
 
@@ -332,7 +328,13 @@ int main(int argc, char *argv[]) {
 
     else if (!strcmp(argv[1], "start")) {
         char b[256];
-        sprintf(b, "start %s %s %s", argv[2], argv[3], argv[4]);
+
+        // pass limits also
+        if (argc >= 6)
+            sprintf(b, "start %s %s %s %s %s", argv[2], argv[3], argv[4], argv[5], argv[6]);
+        else
+            sprintf(b, "start %s %s %s", argv[2], argv[3], argv[4]);
+
         send_cmd(b);
     }
 
